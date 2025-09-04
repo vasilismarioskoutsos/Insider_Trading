@@ -1,14 +1,19 @@
 import io, csv, requests, pandas as pd
 import re
+import numpy as np
 import requests_cache
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 from lxml import etree
 from ratelimiter import RateLimiter
+from helpers import txt, classify_action, infer_unit_type, _format_yyyymmddhhmmss
 
 '''This file gets all the SEC data for 1 day'''
 
 UA = {"User-Agent": "Form4/1.0 (contact: doublethespeedchannel@gmail.com)"}  # SEC asks for this
 BASE = "https://www.sec.gov"
+
+_ACCEPTED_RE_TXT = re.compile(r"ACCEPTANCE-DATETIME:\s*([0-9]{14})")
+_ACCEPTED_RE_HTML = re.compile(r"Accepted:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}:[0-9]{2})")
 
 DEBUG = True # set to true if you want debug prints
 def debug_print(*args, **kwargs):
@@ -138,6 +143,38 @@ def parse_daily_idx(idx_url):
     )
     return df
 
+def accepted_datetime_for_filing(accession_folder: str, filing_txt_url: str) -> str | None:
+    '''
+    Try to read ACCEPTANCE-DATETIME from the submission .txt
+    If missing, fall back to the primary HTML page header ('Accepted: YYYY-MM-DD HH:MM:SS')
+    '''
+    try:
+        txt = fetch_text(filing_txt_url)
+        m = _ACCEPTED_RE_TXT.search(txt)
+        if m:
+            return _format_yyyymmddhhmmss(m.group(1))
+    except Exception as e:
+        debug_print(f"[accepted] txt fetch failed: {filing_txt_url} err={e}")
+
+    # fallback: look for a primary .htm(l) in the folder and parse the header banner
+    try:
+        idx = fetch_json(accession_folder + "index.json")
+        items = [it["name"] for it in idx["directory"]["item"]]
+        # prefer names containing 'primary_doc' then any .htm/.html
+        candidates = sorted(
+            [n for n in items if n.lower().endswith((".htm", ".html"))],
+            key=lambda n: (0 if "primary" in n.lower() else 1, n.lower())
+        )
+        if candidates:
+            html = fetch_text(accession_folder + candidates[0])
+            m = _ACCEPTED_RE_HTML.search(html)
+            if m:
+                return m.group(1)
+    except Exception as e:
+        debug_print(f"[accepted] html fallback failed for {accession_folder}: {e}")
+
+    return None
+
 # jump from the index row to the filing’s folder
 def accession_folder_from_filename(filename: str):
     s = (filename or "").strip()
@@ -184,11 +221,6 @@ def parse_form4_xml(xml_bytes):
         })
     debug_print(f"[parse_form4_xml] Parsed {len(out)} non-derivative transactions")
     return out
-
-# safe text helper
-def txt(node, path):
-    v = node.findtext(path)
-    return v.strip() if v else ""
 
 # footnotes map ( for example price = 0 with explanation)
 def collect_footnotes(root):
@@ -312,19 +344,82 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
             continue
 
         # attach filing level context from the index
+        filing_txt_url = BASE + "/" + row["filename"].lstrip("/")
+        form_type = (row["form"] or "").strip()
+
+        # attach filing level context from the index
         for r in parsed_rows:
             r.update({
                 "companyFromIndex": row["company"].strip(),
                 "cikFromIndex": row["cik"].strip(),
                 "filedDateFromIndex": row["date_filed"].strip(),
+                "formTypeFromIndex": form_type,
                 "accessionFolder": folder,
-                "xmlUrl": xml_url
+                "xmlUrl": xml_url,
+                "filingTxtUrl": filing_txt_url,
             })
         all_rows.extend(parsed_rows)
 
     out = pd.DataFrame(all_rows)
     if out_filename is None:
         out_filename = f"form4_{date}.csv"
+
+    # Fix dates that may appear malformed in the index (e.g., '2025082')
+    out["filedDateFromIndex"] = pd.to_datetime(out["filedDateFromIndex"], errors="coerce").dt.date
+
+    # Numerics
+    for col in ["shares", "pricePerShare", "strikeOrExercisePrice"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    # Roles to proper booleans
+    for b in ["isDirector", "isOfficer", "isTenPctOwner"]:
+        out[b] = out[b].astype(str).str.upper().map({"TRUE": True, "FALSE": False})
+
+    # Action, direction, open-market flags
+    out["action"] = out.apply(lambda r: classify_action(r.get("transactionCode"), r.get("acqDisp")), axis=1)
+    out["isOpenMarket"] = out["transactionCode"].isin(["P", "S"])
+    out["direction"] = out["acqDisp"].map({"A": "ACQUIRED", "D": "DISPOSED"}).fillna("")
+
+    # Cash value where price exists
+    out["grossValue"] = (out["shares"] * out["pricePerShare"]).where(out["pricePerShare"] > 0)
+
+    # isBuySell
+    out["isBuySell"] = out["action"].isin(["BUY", "SELL"])
+
+    # unitType inferred from securityTitle
+    out["unitType"] = out["securityTitle"].map(infer_unit_type)
+
+    # isAmendment from formTypeFromIndex
+    out["isAmendment"] = (out["formTypeFromIndex"] == "4/A")
+
+    # acceptedDatetime (cache per filing to avoid refetching)
+    _accepted_cache = {}
+    def _get_accept(r):
+        key = r.get("filingTxtUrl") or r.get("accessionFolder")
+        if not key:
+            return None
+        if key not in _accepted_cache:
+            _accepted_cache[key] = accepted_datetime_for_filing(
+                r.get("accessionFolder", ""), r.get("filingTxtUrl", "")
+            )
+        return _accepted_cache[key]
+
+    out["acceptedDatetime"] = pd.to_datetime(out["acceptedDatetime"], errors="coerce")
+
+    # netShares: sum signed shares within filing-day/security block
+    # The user asked specifically for ownerCik + securityTitle + transactionDate.
+    # We also keep it signed: A = +, D = -
+    out["signedShares"] = np.where(out["acqDisp"].eq("A"), out["shares"],
+                            np.where(out["acqDisp"].eq("D"), -out["shares"], 0))
+    
+    grp_keys = ["ownerCik", "issuerCik", "securityTitle", "transactionDate"]
+
+    net = (
+        out.groupby(grp_keys, dropna=False, as_index=False)["signedShares"]
+          .sum()
+          .rename(columns={"signedShares": "netShares"})
+    )
+    out = out.merge(net, on=grp_keys, how="left")
     
     debug_print(f"[get_daily_form4_csv] Total parsed rows: {len(out)}")
     out.to_csv(out_filename, index=False, encoding="utf-8-sig")
