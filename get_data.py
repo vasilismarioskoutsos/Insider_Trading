@@ -1,4 +1,5 @@
-import io, csv, requests, pandas as pd
+import io, csv, requests
+import pandas as pd
 import re
 import numpy as np
 import requests_cache
@@ -13,7 +14,7 @@ UA = {"User-Agent": "Form4/1.0 (contact: doublethespeedchannel@gmail.com)"}  # S
 BASE = "https://www.sec.gov"
 
 _ACCEPTED_RE_TXT = re.compile(r"ACCEPTANCE-DATETIME:\s*([0-9]{14})")
-_ACCEPTED_RE_HTML = re.compile(r"Accepted:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}:[0-9]{2})")
+_ACCEPTED_RE_HTML = re.compile(r"Accepted:\s*([0-9]{4}-[0-9]{2}-[0-9]{2}\s+[0-9]{2}:[0-9]{2}:[0-9]{2})", re.I)
 
 DEBUG = True # set to true if you want debug prints
 def debug_print(*args, **kwargs):
@@ -364,6 +365,11 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
     if out_filename is None:
         out_filename = f"form4_{date}.csv"
 
+    if out.empty:
+        out.to_csv(out_filename, index=False, encoding="utf-8-sig")
+        print(f"Saved 0 rows to {out_filename} from {len(form4s)} form 4 filings")
+        return out
+
     # Fix dates that may appear malformed in the index (e.g., '2025082')
     out["filedDateFromIndex"] = pd.to_datetime(out["filedDateFromIndex"], errors="coerce").dt.date
 
@@ -376,8 +382,9 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
         out[b] = out[b].astype(str).str.upper().map({"TRUE": True, "FALSE": False})
 
     # Action, direction, open-market flags
+    out["transactionCode"] = out["transactionCode"].astype(str).str.upper()
+    out["acqDisp"] = out["acqDisp"].astype(str).str.upper()
     out["action"] = out.apply(lambda r: classify_action(r.get("transactionCode"), r.get("acqDisp")), axis=1)
-    out["isOpenMarket"] = out["transactionCode"].isin(["P", "S"])
     out["direction"] = out["acqDisp"].map({"A": "ACQUIRED", "D": "DISPOSED"}).fillna("")
 
     # Cash value where price exists
@@ -404,11 +411,13 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
             )
         return _accepted_cache[key]
 
+    out["acceptedDatetime"] = out.apply(_get_accept, axis=1)  # <-- add this line
     out["acceptedDatetime"] = pd.to_datetime(out["acceptedDatetime"], errors="coerce")
 
     # netShares: sum signed shares within filing-day/security block
     # The user asked specifically for ownerCik + securityTitle + transactionDate.
     # We also keep it signed: A = +, D = -
+    out["isOpenMarket"] = out["transactionCode"].isin(["P", "S"])
     out["signedShares"] = np.where(out["acqDisp"].eq("A"), out["shares"],
                             np.where(out["acqDisp"].eq("D"), -out["shares"], 0))
     
@@ -423,6 +432,5 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
     
     debug_print(f"[get_daily_form4_csv] Total parsed rows: {len(out)}")
     out.to_csv(out_filename, index=False, encoding="utf-8-sig")
-    print(f"Saved {len(out)} rows to {out_filename} from {len(form4s)} form 4 filings")
-
+    print(f"Saved 0 rows to {out_filename} from 0 form 4 filings")
     return out
