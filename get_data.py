@@ -1,4 +1,4 @@
-import io, csv, requests
+import io, csv, requests, time
 import pandas as pd
 import re
 import numpy as np
@@ -6,7 +6,8 @@ import requests_cache
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 from lxml import etree
 from ratelimiter import RateLimiter
-from helpers import txt, classify_action, infer_unit_type, _format_yyyymmddhhmmss
+from email.utils import parsedate_to_datetime
+from helpers import classify_action, infer_unit_type, _format_yyyymmddhhmmss, accession_folder_from_filename, collect_footnotes, reporting_owners, footnote_ids, issuer_info, transaction_rows
 
 '''This file gets all the SEC data for 1 day'''
 
@@ -29,7 +30,7 @@ SESSION = requests_cache.CachedSession(
     allowable_methods = ("GET",),
     allowable_codes = (200,),
     urls_expire_after = {
-        re.compile(r".*/Archives/edgar/daily-index/.*/(?:company|form)\.\d+\.idx$"): 2 * 24 * 3600,  # 2 days
+        re.compile(r".*/Archives/edgar/daily-index/.*/(?:company|form|master)\.\d+\.idx$"): 2 * 24 * 3600,  # 2 days
         re.compile(r".*/Archives/edgar/data/.*/index\.json$"): 365 * 24 * 3600, # 1 year
         re.compile(r".*\.xml$"): 365 * 24 * 3600, # 1 year
     },
@@ -50,8 +51,34 @@ def _get(url: str, timeout: int = 30):
 
     if getattr(resp, "from_cache", False):
         return resp
+
+    if resp.status_code in (429, 503):
+        ra = resp.headers.get("Retry-After")
+        if ra:
+            try:
+                delay = max(0.0, float(ra))
+            except (TypeError, ValueError):
+                try:
+                    from datetime import datetime, timezone
+                    dt = parsedate_to_datetime(ra)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    delay = max(0.0, (dt - datetime.now(timezone.utc)).total_seconds())
+                except Exception:
+                    delay = 0.0
+            debug_print(f"[Retry-After] {url} header={ra} -> sleeping {delay:.3f}s before retry")
+            time.sleep(delay)
+            RL.wait()
+            resp = SESSION.get(url, timeout=timeout)
+            debug_print(f"GET {url} -> {resp.status_code}"
+                        f"{' (cache)' if getattr(resp, 'from_cache', False) else ''} after Retry-After")
+            if getattr(resp, "from_cache", False):
+                return resp
+
+    # After optional Retry-After retry, treat these as transient so Tenacity retries
     if resp.status_code in {429, 502, 503, 504}:
         raise requests.exceptions.HTTPError(f"Transient HTTP {resp.status_code}", response=resp)
+
     if resp.status_code == 403:
         raise requests.exceptions.HTTPError(
             "403 Forbidden from SEC. Ensure a real contact in User-Agent and keep requests ≤10/sec.",
@@ -79,7 +106,14 @@ def fetch_bytes(url):
 
 def parse_daily_idx(idx_url):
     debug_print(f"\n[parse_daily_idx] fetching index: {idx_url}")
-    text = fetch_text(idx_url)
+    try:
+        text = fetch_text(idx_url)
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 404:
+            debug_print(f"[parse_daily_idx] No index for this date: {idx_url}")
+            return pd.DataFrame(columns=["company","form","cik","date_filed","filename"])
+        raise
+
     lines = [ln.rstrip("\n") for ln in text.splitlines()]
 
     # try to locate the header row ("Company Name  Form Type  CIK  Date Filed  File Name/Filename")
@@ -102,7 +136,23 @@ def parse_daily_idx(idx_url):
     if "|" in data_lines[0]:
         reader = csv.reader(io.StringIO("\n".join(data_lines)), delimiter="|")
         rows = [row for row in reader if len(row) >= 5]
-        df = pd.DataFrame(rows, columns=["company", "form", "cik", "date_filed", "filename"])
+
+        # remove header if present (master/company pipe variants)
+        if rows and ("file name" in rows[0][-1].lower() or rows[0][0].strip().upper() == "CIK"):
+            rows = rows[1:]
+
+        # Heuristic: master.idx starts with numeric CIK in column 0
+        def looks_like_cik(s): return bool(re.fullmatch(r"\d{1,10}", (s or "").strip()))
+        if rows and looks_like_cik(rows[0][0]):
+            cols = ["cik", "company", "form", "date_filed", "filename"]  # master.idx
+        else:
+            cols = ["company", "form", "cik", "date_filed", "filename"]  # company/form idx
+
+        df = pd.DataFrame(rows, columns=cols)
+
+        # keep only plausible edgar paths (mirrors fixed-width branch)
+        df = df[df["filename"].str.contains(r"edgar/data/", case=False, na=False)]
+
         debug_print(f"[parse_daily_idx] Parsed {len(df)} rows (pipe-delimited). Head:\n{df.head(3)}")
         return df
 
@@ -135,7 +185,7 @@ def parse_daily_idx(idx_url):
     rows = [split_fixed_width(ln) for ln in data_lines if not ln.strip().startswith("-----")]
     df = pd.DataFrame(rows, columns=["company", "form", "cik", "date_filed", "filename"])
 
-    # Skeep only plausible edgar paths
+    # keep only plausible edgar paths
     df = df[df["filename"].str.contains(r"edgar/data/", case=False, na=False)]
 
     debug_print(
@@ -176,20 +226,6 @@ def accepted_datetime_for_filing(accession_folder: str, filing_txt_url: str) -> 
 
     return None
 
-# jump from the index row to the filing’s folder
-def accession_folder_from_filename(filename: str):
-    s = (filename or "").strip()
-    # match with or without .txt at the end
-    m = re.search(r"edgar/data/(\d{1,10})/([0-9\-]{18,})\.txt$", s, flags = re.IGNORECASE)
-    if not m:
-        m = re.search(r"edgar/data/(\d{1,10})/([0-9\-]{18,})", s, flags = re.IGNORECASE)
-    if not m:
-        raise ValueError(f"Unrecognized EDGAR filename: {filename!r}")
-    cik = m.group(1)
-    acc_nodash = m.group(2).replace("-", "")
-    
-    return f"{BASE}/Archives/edgar/data/{cik}/{acc_nodash}/"
-
 # find the ownership XML inside a form 3/4/5 filing
 def find_ownership_xml(folder_url):
     idx = fetch_json(folder_url + "index.json")
@@ -223,80 +259,6 @@ def parse_form4_xml(xml_bytes):
     debug_print(f"[parse_form4_xml] Parsed {len(out)} non-derivative transactions")
     return out
 
-# footnotes map ( for example price = 0 with explanation)
-def collect_footnotes(root):
-    foot = {}
-    for n in root.findall(".//footnotes/footnote"):
-        fid = n.get("id") or ""
-        foot[fid] = "".join(n.itertext()).strip()
-    return foot
-
-# issuer/company being traded
-def issuer_info(root):
-    return {
-        "issuerCik": txt(root, ".//issuer/issuerCik"),
-        "issuerName": txt(root, ".//issuer/issuerName"),
-        "issuerTicker": txt(root, ".//issuer/issuerTradingSymbol"),
-    }
-
-# reporting owners and roles
-def reporting_owners(root):
-    owners = []
-    for ro in root.findall(".//reportingOwner"):
-        owners.append({
-            "ownerName": txt(ro, ".//reportingOwnerId/rptOwnerName"),
-            "ownerCik": txt(ro, ".//reportingOwnerId/rptOwnerCik"),
-            "isDirector": txt(ro, ".//reportingOwnerRelationship/isDirector"),
-            "isOfficer": txt(ro, ".//reportingOwnerRelationship/isOfficer"),
-            "officerTitle": txt(ro, ".//reportingOwnerRelationship/officerTitle"),
-            "isTenPctOwner": txt(ro, ".//reportingOwnerRelationship/isTenPercentOwner"),
-            "isOther": txt(ro, ".//reportingOwnerRelationship/isOther"),
-            "otherText": txt(ro, ".//reportingOwnerRelationship/otherText"),
-        })
-    return owners
-
-# collect any footnoteId references in a transaction
-def footnote_ids(node):
-    return ",".join(sorted(set([e.get("id") for e in node.findall(".//footnoteId") if e.get("id")])))
-
-# unified row builder for non-derivative and derivative transactions
-def transaction_rows(root, table_xpath, is_derivative: bool, issuer, owners, footnotes):
-    rows = []
-    for t in root.findall(table_xpath):
-        txn_date = txt(t, ".//transactionDate/value")
-        txn_code = txt(t, ".//transactionCoding/transactionCode")
-        acq_disp = txt(t, ".//transactionAmounts/transactionAcquiredDisposedCode/value")
-        shares = txt(t, ".//transactionAmounts/transactionShares/value")
-        price = txt(t, ".//transactionAmounts/transactionPricePerShare/value")
-        sec_title = txt(t, ".//securityTitle/value")
-        strike = txt(t, ".//conversionOrExercisePrice/value") if is_derivative else ""
-        fids = footnote_ids(t)
-        ftxt = "; ".join(footnotes.get(fid, "") for fid in fids.split(",") if fid)
-
-        for own in (owners or [{"ownerName": "", "ownerCik": ""}]):
-            rows.append({
-                "issuerCik": issuer["issuerCik"],
-                "issuerName": issuer["issuerName"],
-                "issuerTicker": issuer["issuerTicker"],
-                "ownerName": own.get("ownerName", ""),
-                "ownerCik": own.get("ownerCik", ""),
-                "isDirector": own.get("isDirector", ""),
-                "isOfficer": own.get("isOfficer", ""),
-                "officerTitle": own.get("officerTitle", ""),
-                "isTenPctOwner": own.get("isTenPctOwner", ""),
-                "securityTitle": sec_title,
-                "transactionDate": txn_date,
-                "transactionCode": txn_code, # P (purchase), S (sale)
-                "acqDisp": acq_disp, # A =Acquired, D = Disposed
-                "shares": shares,
-                "pricePerShare": price,
-                "strikeOrExercisePrice": strike,
-                "derivativeFlag": "Y" if is_derivative else "N",
-                "footnoteIds": fids,
-                "footnotesText": ftxt,
-            })
-    return rows
-
 # extended parser that emits issuer/owner + both non-deriv and deriv transactions
 def parse_form4_xml_extended(xml_bytes):
     '''
@@ -318,18 +280,30 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
     Writes a CSV with issuer, owner roles, transactions (non-deriv & deriv), prices, A/D flags, and footnotes
     For all daily transactions
     '''
-    idx_url = f"{BASE}/Archives/edgar/daily-index/{date[:4]}/{quarter}/company.{date}.idx"
-    debug_print(f"\n[get_daily_form4_csv] date={date} quarter={quarter}")
-    debug_print(f"[get_daily_form4_csv] Index URL: {idx_url}")
+    master_url  = f"{BASE}/Archives/edgar/daily-index/{date[:4]}/{quarter}/master.{date}.idx"
+    company_url = f"{BASE}/Archives/edgar/daily-index/{date[:4]}/{quarter}/company.{date}.idx"
 
-    df = parse_daily_idx(idx_url)
+    debug_print(f"\n[get_daily_form4_csv] date={date} quarter={quarter}")
+    debug_print(f"[get_daily_form4_csv] Trying master index: {master_url}")
+    try:
+        df = parse_daily_idx(master_url)
+        if df.empty:
+            debug_print("[get_daily_form4_csv] master empty, falling back to company index")
+            df = parse_daily_idx(company_url)
+    except requests.HTTPError as e:
+        if getattr(e, "response", None) and e.response.status_code == 404:
+            debug_print("[get_daily_form4_csv] master 404, falling back to company index")
+            df = parse_daily_idx(company_url)
+        else:
+            raise
+
     form4s = df[df["form"].str.strip().isin(["4", "4/A"])].reset_index(drop=True)
     debug_print(f"[get_daily_form4_csv] Found {len(form4s)} Form 4/4A filings")
 
     all_rows = []
     for _, row in form4s.iterrows():
         try:
-            folder = accession_folder_from_filename(row["filename"])
+            folder = accession_folder_from_filename(row["filename"], BASE)
         except Exception as e:
             debug_print(f"  [skip] bad filename={row.get('filename')} err={e}")
             continue
@@ -338,6 +312,7 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
             debug_print(f"  [skip] No ownership XML in folder: {folder}")
             continue
         try:
+            time.sleep(float(np.random.uniform(0.05, 0.2)))
             parsed_rows = parse_form4_xml_extended(fetch_bytes(xml_url))
             debug_print(f"  [ok] {len(parsed_rows)} rows from {xml_url}")
         except Exception as error:
@@ -390,7 +365,6 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
     # Cash value where price exists
     out["grossValue"] = (out["shares"] * out["pricePerShare"]).where(out["pricePerShare"] > 0)
 
-    # isBuySell
     out["isBuySell"] = out["action"].isin(["BUY", "SELL"])
 
     # unitType inferred from securityTitle
@@ -414,9 +388,7 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
     out["acceptedDatetime"] = out.apply(_get_accept, axis=1)  # <-- add this line
     out["acceptedDatetime"] = pd.to_datetime(out["acceptedDatetime"], errors="coerce")
 
-    # netShares: sum signed shares within filing-day/security block
-    # The user asked specifically for ownerCik + securityTitle + transactionDate.
-    # We also keep it signed: A = +, D = -
+    # netShares = sum signed shares within filing-day/security block
     out["isOpenMarket"] = out["transactionCode"].isin(["P", "S"])
     out["signedShares"] = np.where(out["acqDisp"].eq("A"), out["shares"],
                             np.where(out["acqDisp"].eq("D"), -out["shares"], 0))
@@ -430,7 +402,6 @@ def get_daily_form4_csv(date: str, quarter: str, out_filename: str | None = None
     )
     out = out.merge(net, on=grp_keys, how="left")
     
-    debug_print(f"[get_daily_form4_csv] Total parsed rows: {len(out)}")
     out.to_csv(out_filename, index=False, encoding="utf-8-sig")
-    print(f"Saved 0 rows to {out_filename} from 0 form 4 filings")
+    print(f"Saved {len(out)} rows to {out_filename} from {len(form4s)} Form 4/4-A filings")
     return out

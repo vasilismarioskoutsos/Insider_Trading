@@ -1,0 +1,17 @@
+This file explain all the column in .csv files
+
+direction: A friendly label from acqDisp: A → ACQUIRED, D → DISPOSED.
+strikeOrExercisePrice: If the security is a derivative (e.g., option, RSU that converts, warrant), this is the conversion/exercise price per unit. For ordinary common stock trades, it’s blank.
+derivativeFlag: "Y" if the row came from the <derivativeTable> in the Form 4 XML; "N" for the <nonDerivativeTable> (i.e., the stock itself).
+unitType: A normalized type inferred from securityTitle (your infer_unit_type helper). Examples: “Common Stock”, “Option”, “RSU”. If the title is unusual (e.g., “Common Shares”), it may fall back to “Other”.
+isTenPctOwner: True means the person beneficially owns more than 10% of a registered class of the issuer’s equity securities at the time of the transaction
+
+grossValue: shares * pricePerShare when pricePerShare > 0, otherwise blank (NaN). This is a simple cash notional (no fees).
+signedShares: Signed quantity for aggregation: +shares when acqDisp == "A", -shares when "D", else 0.
+netShares: Sum of signedShares over the group
+(ownerCik, issuerCik, securityTitle, transactionDate). That total is then merged back onto every row in that group, so each row shows the same net figure for that day/security/owner.
+
+footnoteIds: Any footnote anchors referenced in that transaction row (e.g., F1,F2).
+footnotesText concatenates their text.
+
+isAmendment: True when formTypeFromIndex == "4/A", else False.
